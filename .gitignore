@@ -1,0 +1,4 @@
+scratch-*
+*.token
+.env
+*.pdf
