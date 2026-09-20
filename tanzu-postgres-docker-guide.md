@@ -83,7 +83,15 @@ sudo mkdir -p /data/postgres-18
 sudo chmod 700 /data/postgres-18
 ```
 
-One thing worth calling out: Rocky Linux 9 runs SELinux in enforcing mode by default, and normally that's exactly the kind of thing that blocks a container from writing to a bind-mounted host directory. In our testing, Docker handled this fine without any extra `:Z` mount flag or SELinux relabeling — the container started and initialized the database on the first try. If you're on a more locked-down VM and see permission errors when the container starts, that's the first thing to check (add `:Z` to the volume flag below), but don't add it pre-emptively — it wasn't needed for us and it changes the SELinux label on that whole directory.
+One thing worth calling out: Rocky Linux 9 runs SELinux in enforcing mode by default, and normally that's exactly the kind of thing that blocks a container from writing to a bind-mounted host directory. In our testing, Docker handled this fine without any extra `:Z` mount flag or SELinux relabeling — the container started and initialized the database on the first try. If you're on a more locked-down VM and see permission errors when the container starts, that's the first thing to check, but don't add it pre-emptively — it wasn't needed for us and it changes the SELinux label on that whole directory.
+
+If you do need it, it gets appended directly to the end of the `-v` flag in Step 6, after the container-side path:
+
+```bash
+-v /data/postgres-18:/var/lib/pgsql/data:Z
+```
+
+Nothing else in the command changes — just that one flag. Docker actually supports two variants here: `:Z` (uppercase) relabels the directory for **exclusive** use by this one container, while `:z` (lowercase) relabels it as **shared**, usable by multiple containers. For a single Postgres container like this, `:Z` (uppercase) is the one you want.
 
 ## Step 5: Open the firewall port (only if you need to)
 
