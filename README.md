@@ -25,6 +25,12 @@ sudo ./install-tanzu-postgres.sh --with-docker
 sudo ./install-postgres-opensource.sh --with-docker
 ```
 
+## After you're running
+
+Once Postgres is up (either image), **[hands-on-labs-guide.md](hands-on-labs-guide.md)** picks up where the setup guide leaves off: `psql` basics, schemas/roles, SQL & data types, transactions & MVCC, indexes, observability, and advanced/optional sections on extensions (`pg_stat_statements`, `pgvector`, PostGIS), replication, and point-in-time recovery — all with commands tested against both Tanzu and open-source Postgres, and callouts on how each concept differs in Oracle/SQL Server.
+
+Run **`seed-sample-data.sql`** first (instructions in Step 0 of that guide) — the labs need a `customers`/`orders` table with real data volume that a bare container doesn't have.
+
 ## What you'll need
 
 - A Rocky Linux 9 (or RHEL-family) VM with root/sudo access
