@@ -13,8 +13,17 @@ A single Tanzu Postgres 18.6 container running on your VM, listening on port 543
 - A Linux VM. We used Rocky Linux 9.8, and these steps assume RHEL/Rocky 9 (`dnf`-based). If you're on Ubuntu or something else, the Docker install commands will differ slightly — the Postgres steps themselves are identical everywhere.
 - Root or sudo access on that VM.
 - **Docker already installed and running.** Most workshop VMs will come with this pre-installed. If yours doesn't, see the optional section right below — don't skip ahead assuming it'll just work.
-- A network path from the VM to `*.broadcom.com` (outbound HTTPS). No inbound firewall changes are needed unless you want to reach Postgres from a different machine — see Step 5.
-- A Broadcom Support Portal account. If you don't have one, Step 1 covers signing up.
+- A network path from the VM to `*.broadcom.com` (outbound HTTPS) if you're using Tanzu Postgres, or to Docker Hub if you're using the open-source image. No inbound firewall changes are needed unless you want to reach Postgres from a different machine — see Step 5.
+- A Broadcom Support Portal account **if you're using Tanzu Postgres**. If you don't have one, Step 1 covers signing up. Not needed at all for the open-source path below.
+
+## Which image should you use?
+
+This guide covers two options:
+
+- **Tanzu Postgres** (VMware's build) — Steps 1 through 8 below. Needs a free Broadcom Support Portal account and a registry token, but you get a handful of extra tuning env vars (`POSTGRES_MAX_CONNECTIONS`, `POSTGRES_SHARED_BUFFERS`, etc.) baked into the image's entrypoint.
+- **Open-source Postgres** (`postgres:latest` from Docker Hub) — no account, no login, nothing to sign up for. Same underlying Postgres engine, same SQL, same `psql` — just a different image with a couple of real differences worth knowing about (covered inline below): it won't start without an explicit password, its default data path is different, and tuning goes through `-c` flags on `docker run` instead of Tanzu's custom env vars.
+
+If a customer doesn't have (or doesn't want to create) a Broadcom account, use the open-source path — it's a legitimate fallback, not a lesser demo. **If you're going that route, skip Steps 1 and 2 entirely** and jump to Step 3, which has a separate command for it.
 
 ## Optional: installing Docker
 
@@ -74,6 +83,14 @@ docker pull tanzu-sql-postgres.packages.broadcom.com/postgres-oci:v18.6
 
 This is about a 2 GB image, so give it a minute depending on your connection.
 
+**Using the open-source image instead?** Skip the above and just do this — no login required, it's public:
+
+```bash
+docker pull postgres:latest
+```
+
+Everything from here on has one command block for each path. Use whichever one matches what you pulled.
+
 ## Step 4: Set up a data directory
 
 Postgres needs somewhere on disk to keep its data so it survives a container restart.
@@ -92,6 +109,18 @@ If you do need it, it gets appended directly to the end of the `-v` flag in Step
 ```
 
 Nothing else in the command changes — just that one flag. Docker actually supports two variants here: `:Z` (uppercase) relabels the directory for **exclusive** use by this one container, while `:z` (lowercase) relabels it as **shared**, usable by multiple containers. For a single Postgres container like this, `:Z` (uppercase) is the one you want.
+
+**Using the open-source image?** The directory setup is different — and this one actually matters, not just a "check if you hit an error" footnote:
+
+```bash
+sudo mkdir -p /data/postgres-oss
+sudo chown 999:999 /data/postgres-oss
+sudo chmod 700 /data/postgres-oss
+```
+
+Tanzu's image runs its startup/init logic in a way that's fine with a root-owned directory. The official `postgres` image drops privileges to its own internal `postgres` user (UID **999**) before touching the data directory — mount a root-owned directory and it fails outright with `mkdir: cannot create directory '/var/lib/postgresql': Permission denied`, repeated several times, before the container exits. `chown 999:999` fixes it. We hit this exact error while testing, so don't skip the `chown` line thinking it's optional.
+
+Also note the path is `/data/postgres-oss`, not `/data/postgres-18` — just to keep the two images' data clearly separate if you ever run both on the same VM (not at the same time, same port).
 
 ## Step 5: Open the firewall port (only if you need to)
 
@@ -131,6 +160,23 @@ docker run -d \
 
 That's it — superuser `appuser` with the password you chose, a default database also called `appuser`, 100 max connections, and whatever the image's default memory settings are. Good enough for the workshop.
 
+### Basic mode — open-source image
+
+Same idea, different image and volume path. `POSTGRES_PASSWORD` isn't optional here — leave it out and the container refuses to start (see Troubleshooting):
+
+```bash
+docker run -d \
+  --name postgres-oss \
+  -e POSTGRES_USER=appuser \
+  -e POSTGRES_PASSWORD=pick-your-own-password \
+  -v /data/postgres-oss:/var/lib/postgresql \
+  -p 5432:5432 \
+  --restart unless-stopped \
+  postgres:latest
+```
+
+Note the mount is `/var/lib/postgresql` (no trailing `/data`) — that's the directory the official image actually declares as its volume; Postgres creates a versioned subfolder inside it on its own (currently `18/docker` for the version this pulls today, but that number moves as Postgres releases new majors, so don't hardcode it).
+
 ### Full example, every option explained
 
 If you want more control — a specific database name, connection limits, memory tuning, a named volume instead of a bind mount — here's the fuller version we actually ran and confirmed working:
@@ -169,11 +215,33 @@ Going through it line by line:
 
 All of the above env vars only take effect the **first time** the container initializes an empty data directory. If you've already run the container once against that volume/directory, changing these values and re-running won't do anything — Postgres won't re-run `initdb` against existing data. You'd need to wipe the volume/directory (see Cleanup below) and start over for changes to take effect.
 
+### Tuning the open-source image
+
+Here's the part that trips people up: none of Tanzu's `POSTGRES_MAX_CONNECTIONS` / `POSTGRES_SHARED_BUFFERS` / `POSTGRES_WORK_MEM` / `POSTGRES_EFFECTIVE_CACHE_SIZE` env vars do anything on the official image — we tested it, they're silently ignored. The real way to tune it is `-c setting=value` arguments appended **after** the image name:
+
+```bash
+docker run -d \
+  --name postgres-oss \
+  -e POSTGRES_USER=appuser \
+  -e POSTGRES_PASSWORD=mysecurepassword \
+  -e POSTGRES_DB=appdb \
+  -v /data/postgres-oss:/var/lib/postgresql \
+  -p 5432:5432 \
+  --restart unless-stopped \
+  postgres:latest \
+  -c max_connections=200 \
+  -c shared_buffers=512MB
+```
+
+We confirmed this one actually takes effect (`SHOW max_connections;` returned `200`, `SHOW shared_buffers;` returned `512MB`) — unlike the env var version. Any `postgresql.conf` setting can go after `-c` this way, not just these two. Unlike Tanzu's env vars, these apply on every container start, not just the first `initdb` — so if you restart the container later without them, it'll fall back to defaults.
+
+There's no equivalent to `POSTGRES_INITDB_ARGS` needed here for encoding/checksums — the official image already defaults to UTF8 and enables data checksums on `initdb` without any extra flags (we didn't have to ask for either).
+
 ## Step 7: Verify it's actually working
 
-The rest of this section uses `postgres-18` and user `appuser` — swap in whatever you actually named your container and user.
+Everything in this step and the next one is identical for both images — just swap `postgres-18` for `postgres-oss` in the commands if that's what you named your container.
 
-If you didn't set `POSTGRES_PASSWORD` (only relevant if you skipped it entirely, which we don't recommend), grab the auto-generated one from the logs:
+If you didn't set `POSTGRES_PASSWORD` on the **Tanzu** image (only relevant if you skipped it entirely, which we don't recommend), grab the auto-generated one from the logs — this doesn't apply to the open-source image, since it refuses to start without a password in the first place, so there's nothing auto-generated to go looking for:
 
 ```bash
 docker logs postgres-18 2>&1 | grep -A1 "Password:"
@@ -281,7 +349,12 @@ That's genuinely most of what you need for a demo — create something, show dat
 
 ## Prefer to skip typing all of this?
 
-`install-tanzu-postgres.sh`, included alongside this guide, runs Steps 1 through 7 for you — it asks for your Broadcom username and token interactively (input hidden, never written to disk by the script), and narrates what it's doing at each stage so you can still follow along against the guide. Pair it with `install-docker-rocky9.sh` first if your VM doesn't have Docker yet. Neither script touches the psql basics in Step 8 — that part's still on you to click through live.
+Two scripts, included alongside this guide, cover Steps 1 through 7 for either path:
+
+- `install-tanzu-postgres.sh` — for the Tanzu image. Asks for your Broadcom username and token interactively (input hidden, never written to disk), narrates what it's doing at each stage.
+- `install-postgres-opensource.sh` — for the open-source image. No account, no login prompt — just pulls `postgres:latest` and runs it, same narrated style.
+
+Pair either one with `install-docker-rocky9.sh` first if your VM doesn't have Docker yet. Neither script touches the psql basics in Step 8 — that part's still on you to click through live.
 
 ## Troubleshooting
 
@@ -290,6 +363,12 @@ The token itself is probably fine — this almost always means something between
 
 **"cannot attach stdin to a TTY-enabled container because stdin is not a terminal"**
 You used `-it` on `docker exec` from a context without a real terminal (a script, a non-interactive SSH session, etc.). Drop the `-it` flags.
+
+**Open-source image: "Error: Database is uninitialized and superuser password is not specified."**
+You omitted `POSTGRES_PASSWORD`. Unlike Tanzu's image, the official one won't auto-generate a password and just refuses to start — add `-e POSTGRES_PASSWORD=something` and re-run.
+
+**Open-source image: `mkdir: cannot create directory '/var/lib/postgresql': Permission denied` (repeated, then the container exits)**
+The data directory on the host is owned by root, but the official image's entrypoint runs as its internal `postgres` user (UID 999) and can't write into it. Run `sudo chown 999:999 /data/postgres-oss` (see Step 4) and re-run.
 
 **Container starts then immediately exits**
 Check `docker logs postgres-18` for the actual error — usually it's a permissions issue on the data directory, or a leftover `postgresql.pid` file if you're reusing an old data directory from a previous run. If it's a truly fresh directory and this happens, check `getenforce` and try adding `:Z` to the volume mount.
@@ -342,6 +421,14 @@ docker rmi tanzu-sql-postgres.packages.broadcom.com/postgres-oci:v18.6
 
 # forget the registry login (removes the stored token from /root/.docker/config.json)
 docker logout tanzu-sql-postgres.packages.broadcom.com
+```
+
+**Same, but for the open-source image** — replace container name/data path accordingly, and skip the `docker logout` line entirely, since there's no login to forget:
+
+```bash
+docker rm -f postgres-oss
+sudo rm -rf /data/postgres-oss
+docker rmi postgres:latest
 ```
 
 If you also want to remove Docker itself from the VM (not usually necessary — most people just leave it installed for next time):
