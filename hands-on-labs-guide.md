@@ -6,26 +6,39 @@ This picks up right after **`tanzu-postgres-docker-guide.md`** — you should al
 docker exec -it <container> psql -U appuser -d appdb
 ```
 
+Step 0 below builds a `shop` database inside that same container. From Step 1 onward, every command in this guide connects with `-d shop` instead of `-d appdb`.
+
 Everything below was tested end-to-end on both images. Where a command differs between them, both versions are shown. Swap in your own container name if you didn't use the defaults.
 
-## Step 0: Load the sample data
+## Step 0: Build the `shop` database
 
-The labs below need a `customers` table and an `orders` table with real row volume (the indexing lab in Step 6 needs thousands of rows to actually show a plan change — a handful of rows won't do it). `seed-sample-data.sql`, included alongside this guide, creates both.
+The labs below run against a realistic two-table e-commerce dataset — `customers` and `orders`, in a dedicated `sales` schema, inside a database called `shop` — with real row volume (the indexing lab in Step 6 needs thousands of rows to actually show a plan change — a handful of rows won't do it). Two files, included alongside this guide, build it: `01_shop_schema.sql` creates the schema/tables/views, `02_load_data.sql` populates ~2,000 customers and ~50,000 orders with reproducible random data (it seeds the RNG, so you get the exact same rows every time you run it). Both are sourced from [ranjith-bp87/psql-training](https://github.com/ranjith-bp87/psql-training), reused here with attribution.
 
 ```bash
-docker cp seed-sample-data.sql <container>:/tmp/seed.sql
-docker exec <container> psql -U appuser -d appdb -f /tmp/seed.sql
+docker cp 01_shop_schema.sql <container>:/tmp/01_shop_schema.sql
+docker cp 02_load_data.sql <container>:/tmp/02_load_data.sql
+
+docker exec <container> psql -U appuser -d appdb -c "CREATE DATABASE shop;"
+docker exec <container> psql -U appuser -d shop -f /tmp/01_shop_schema.sql
+docker exec <container> psql -U appuser -d shop -f /tmp/02_load_data.sql
 ```
+
+`01_shop_schema.sql` also does `ALTER DATABASE shop SET search_path = sales, public;` — every new session that connects to `shop` (including every `docker exec ... -d shop psql` below) automatically sees the `sales` schema first, so you can write plain `customers`/`orders` instead of `sales.customers`/`sales.orders`.
 
 Confirm it worked:
 ```sql
+\c shop
 \dt
--- customers, orders
+-- sales.customers, sales.orders
+SELECT count(*) FROM customers;
+-- 2000
 SELECT count(*) FROM orders;
--- 50025
+-- 50000
 ```
 
 If you skip this step, every query below that references `customers` or `orders` will fail with `relation "customers" does not exist` — that's expected, not a bug; just come back and run this first.
+
+From here on, every `docker exec -it <container> psql -U appuser -d appdb` in this guide becomes `-d shop` — the labs live in the `shop` database, not `appdb`.
 
 ## Step 1: Observe the server
 
@@ -60,18 +73,30 @@ Open a second `docker exec -it <container> psql ...` session in another terminal
 | `\q` | Quit |
 
 ```sql
-\l                                   -- appdb, postgres, template0, template1
-\dt                                  -- customers, orders
-\d customers                         -- id (PK), name, city, country; referenced by orders.customer_id
+\l                                   -- appdb, postgres, shop, template0, template1
+\dt                                  -- sales.customers, sales.orders (search_path already points at sales)
+\d customers                         -- customer_id (PK, IDENTITY), full_name, email (UNIQUE), country, city,
+                                      -- segment (CHECK), signed_up_on, marketing_opt_in; referenced by orders.customer_id
 \timing on
-SELECT * FROM customers LIMIT 5;
+SELECT customer_id, full_name, city, country FROM customers LIMIT 5;
 \x
-SELECT * FROM customers LIMIT 5;     -- same 5 rows, one field per line
+SELECT customer_id, full_name, city, country FROM customers LIMIT 5;     -- same 5 rows, one field per line
 \x
 \timing off
 ```
 
-**A real gotcha, confirmed on both images:** connecting straight from the VM **host** with `psql "postgresql://appuser@localhost/appdb"` fails with `bash: psql: command not found` — no client is installed on a bare VM host by default. Stick with `docker exec -it <container> psql ...` (what this whole guide uses). If you specifically want a host-side connection string, `sudo dnf install -y postgresql` gets you a client (an older v13 client against our v18 server — still fully compatible for everything here), and then `PGPASSWORD=<password> psql "postgresql://appuser@localhost:5432/appdb"` works.
+Real output, identical on both images (the load script seeds its RNG, so this is exactly reproducible):
+```
+ customer_id | full_name  |     city      | country
+-------------+------------+---------------+---------
+           1 | Customer 1 | London        | UK
+           2 | Customer 2 | Dubai         | AE
+           3 | Customer 3 | Bengaluru     | IN
+           4 | Customer 4 | San Francisco | US
+           5 | Customer 5 | Austin        | US
+```
+
+**A real gotcha, confirmed on both images:** connecting straight from the VM **host** with `psql "postgresql://appuser@localhost/shop"` fails with `bash: psql: command not found` — no client is installed on a bare VM host by default. Stick with `docker exec -it <container> psql ...` (what this whole guide uses). If you specifically want a host-side connection string, `sudo dnf install -y postgresql` gets you a client (an older v13 client against our v18 server — still fully compatible for everything here), and then `PGPASSWORD=<password> psql "postgresql://appuser@localhost:5432/shop"` works.
 
 **Compared to Oracle/SQL Server:** Oracle's equivalent client is `sqlplus`; SQL Server's is `sqlcmd`/SSMS. Neither has a direct equivalent to psql's meta-commands — `SELECT * FROM information_schema.tables` works identically in all three if you'd rather query the catalog directly.
 
@@ -80,7 +105,7 @@ SELECT * FROM customers LIMIT 5;     -- same 5 rows, one field per line
 One running Postgres server (a **cluster** — nothing to do with clustering/HA) can host many **databases**. Each database has **schemas** (namespaces), and each schema holds tables, views, indexes, and sequences. A fully-qualified name is `schema.table`.
 
 ```sql
-\dn                              -- public (pg_database_owner) only, before you create anything
+\dn                              -- public (pg_database_owner), sales (appuser) — sales came from Step 0's load
 \du                              -- appuser: Superuser, Create role, Create DB, Replication, Bypass RLS
 CREATE SCHEMA training;
 CREATE SEQUENCE training.ticket_no;
@@ -104,15 +129,34 @@ CREATE TABLE demo_orders (
 INSERT INTO demo_orders (total) VALUES (19.99), (45.00), (120.50);
 SELECT * FROM demo_orders WHERE total > 20 ORDER BY total;
 
-SELECT o.id, c.name, o.total
-FROM orders o JOIN customers c ON c.id = o.customer_id
-WHERE o.total > 400
-ORDER BY o.total DESC
+SELECT o.order_id, c.full_name, o.order_amount
+FROM orders o JOIN customers c ON c.customer_id = o.customer_id
+WHERE o.order_amount > 4500
+ORDER BY o.order_amount DESC
 LIMIT 5;
 
 SELECT country, count(*) AS customers FROM customers GROUP BY country ORDER BY customers DESC;
 
 EXPLAIN (ANALYZE, BUFFERS) SELECT * FROM orders WHERE customer_id = 42;
+```
+
+Real output, identical on both images (same seeded data on Tanzu and open-source):
+```
+ order_id |   full_name   | order_amount
+----------+---------------+--------------
+    10493 | Customer 78   |      4999.95
+    28854 | Customer 1608 |      4999.94
+    13842 | Customer 474  |      4999.94
+     2466 | Customer 956  |      4999.68
+     3744 | Customer 2000 |      4999.64
+
+ country | customers
+---------+-----------
+ IN      |       730
+ US      |       484
+ SG      |       281
+ AE      |       279
+ UK      |       226
 ```
 
 Data types worth knowing:
@@ -137,18 +181,18 @@ Constraints — primary key, foreign key, unique, not-null, check — are all en
 
 **MVCC — the centerpiece:** Postgres never overwrites a row in place. An `UPDATE` writes a *new* row version and marks the old one expired. Readers see a consistent snapshot, so readers never block writers and writers never block readers. The consequence: expired versions (**dead tuples**) pile up as **bloat**, and a background process called **autovacuum** reclaims that space.
 
-Open two terminals, both running `docker exec -it <container> psql -U appuser -d appdb`:
+Open two terminals, both running `docker exec -it <container> psql -U appuser -d shop`:
 
 **Terminal A:**
 ```sql
 BEGIN;
-UPDATE customers SET country='SG' WHERE id=1;
+UPDATE customers SET country='SG' WHERE customer_id=1;
 -- don't commit yet
 ```
 
 **Terminal B, while A is uncommitted:**
 ```sql
-SELECT country FROM customers WHERE id=1;   -- 'IN' — the OLD value; A's change is invisible
+SELECT country FROM customers WHERE customer_id=1;   -- 'UK' — the OLD value; A's change is invisible
 ```
 
 **Back in Terminal A:**
@@ -158,8 +202,10 @@ COMMIT;
 
 **Terminal B, re-read:**
 ```sql
-SELECT country FROM customers WHERE id=1;   -- 'SG' — now visible
+SELECT country FROM customers WHERE customer_id=1;   -- 'SG' — now visible
 ```
+
+Reset it back to `UK` afterward (`UPDATE customers SET country='UK' WHERE customer_id=1;`) so the next person to run this lab starts from the same baseline.
 
 **Either terminal:**
 ```sql
@@ -176,16 +222,30 @@ An index (like the index at the back of a book) lets Postgres find rows without 
 
 ```sql
 -- before an index:
-EXPLAIN (ANALYZE) SELECT * FROM orders WHERE customer_id = 42;
--- Seq Scan on orders (actual time≈2.7-3.4ms rows=25) - Rows Removed by Filter: 50000
-
+EXPLAIN (ANALYZE, BUFFERS) SELECT * FROM orders WHERE customer_id = 42;
+```
+```
+ Seq Scan on orders  (cost=0.00..1191.00 rows=24 width=55) (actual time=0.112..5.052 rows=24 loops=1)
+   Filter: (customer_id = 42)
+   Rows Removed by Filter: 49976
+   Buffers: shared hit=566
+ Execution Time: 5.074 ms      -- open-source; Tanzu came in at 3.564 ms on the same query
+```
+```sql
 CREATE INDEX ON orders (customer_id);
 
 -- after:
-EXPLAIN (ANALYZE) SELECT * FROM orders WHERE customer_id = 42;
--- Bitmap Heap Scan -> Bitmap Index Scan (actual time≈0.09-0.11ms rows=25)
+EXPLAIN (ANALYZE, BUFFERS) SELECT * FROM orders WHERE customer_id = 42;
 ```
-Roughly a 25-30x speedup, confirmed on both images. This needs Step 0's 50,000-row seed to show up — on a 5-row table the planner correctly prefers a sequential scan even with an index present.
+```
+ Bitmap Heap Scan on orders  (cost=4.48..85.95 rows=24 width=55) (actual time=0.046..0.071 rows=24 loops=1)
+   Recheck Cond: (customer_id = 42)
+   Heap Blocks: exact=24
+   ->  Bitmap Index Scan on orders_customer_id_idx  (cost=0.00..4.47 rows=24 width=0) (actual time=0.037..0.038 rows=24 loops=1)
+         Index Cond: (customer_id = 42)
+ Execution Time: 0.086 ms      -- open-source; Tanzu came in at 0.091 ms
+```
+Roughly 40-60x faster after the index, confirmed on both images — the exact multiple moves around run to run since this is wall-clock timing on a live box, but the plan flip (seq scan → bitmap index scan) is the point, and it's consistent every time. This needs Step 0's ~50,000-row load to show up — on a handful of rows the planner correctly prefers a sequential scan even with an index present. Drop the index again afterward (`DROP INDEX orders_customer_id_idx;`) so the next person running this lab gets the same "before" starting point.
 
 **B-Tree** (the default) handles equality, ranges, and sorting. **BRIN** is for big, physically-ordered data (e.g. a timestamp column on an append-only table). GIN (`jsonb`/arrays/full-text) and GiST (spatial) exist too, beyond this guide's scope.
 
@@ -301,10 +361,10 @@ docker network connect pglab postgres-18
 # 2. the catch-all "host all all all" line in pg_hba.conf does NOT cover replication -
 #    add an explicit line and reload
 docker exec postgres-18 bash -c 'echo "host replication all 172.18.0.0/16 scram-sha-256" >> /var/lib/pgsql/data/pg_hba.conf'
-docker exec postgres-18 psql -U appuser -d appdb -c "SELECT pg_reload_conf();"
+docker exec postgres-18 psql -U appuser -d shop -c "SELECT pg_reload_conf();"
 
 # 3. pg_basebackup waits on "waiting for checkpoint" until you force one
-docker exec postgres-18 psql -U appuser -d appdb -c "CHECKPOINT;"
+docker exec postgres-18 psql -U appuser -d shop -c "CHECKPOINT;"
 
 # 4. seed the replica's data directory from a live base backup
 mkdir -p /data/postgres-18-replica
@@ -329,10 +389,10 @@ docker network connect pglab postgres-oss
 # 2. the catch-all "host all all all" line in pg_hba.conf does NOT cover replication -
 #    add an explicit line and reload
 docker exec postgres-oss bash -c 'echo "host replication all 172.18.0.0/16 scram-sha-256" >> /var/lib/postgresql/18/docker/pg_hba.conf'
-docker exec postgres-oss psql -U appuser -d appdb -c "SELECT pg_reload_conf();"
+docker exec postgres-oss psql -U appuser -d shop -c "SELECT pg_reload_conf();"
 
 # 3. pg_basebackup waits on "waiting for checkpoint" until you force one
-docker exec postgres-oss psql -U appuser -d appdb -c "CHECKPOINT;"
+docker exec postgres-oss psql -U appuser -d shop -c "CHECKPOINT;"
 
 # 4. seed the replica's data directory from a live base backup
 mkdir -p /data/postgres-oss-replica && chown 999:999 /data/postgres-oss-replica
@@ -354,9 +414,10 @@ SELECT client_addr, state, sync_state FROM pg_stat_replication;  -- streaming, a
 -- on the replica:
 SELECT pg_is_in_recovery();                                      -- t
 ```
+`pg_basebackup` copies the whole cluster, not just one database — the replica gets `shop` (and its `sales.customers`/`sales.orders` data) automatically, no extra step needed.
 ```bash
-docker exec postgres-18 psql -U appuser -d appdb -c "INSERT INTO customers (name, city, country) VALUES ('ReplicaTest', 'Sydney', 'AU');"
-docker exec postgres-18-replica psql -U appuser -d appdb -c "SELECT * FROM customers WHERE name='ReplicaTest';"
+docker exec postgres-18 psql -U appuser -d shop -c "INSERT INTO customers (full_name, email, country, city) VALUES ('ReplicaTest', 'replicatest@example.com', 'AU', 'Sydney');"
+docker exec postgres-18-replica psql -U appuser -d shop -c "SELECT * FROM customers WHERE full_name='ReplicaTest';"
 ```
 Write on the primary, read on the replica a second later — the row shows up.
 
@@ -391,16 +452,19 @@ docker run --rm --network pglab -v /data/postgres-18-pitr-basebackup:/backup -e 
   -h postgres-18 -U appuser -D /backup -P
 ```
 
+Connect with `-d shop` for all three of these (`docker exec postgres-18 psql -U appuser -d shop`):
 ```sql
 -- "good" marker, then force the WAL segment to actually reach the archive:
-INSERT INTO customers (name, city, country) VALUES ('PITR-GOOD-MARKER', 'Good City', 'ZZ');
+INSERT INTO customers (full_name, email, country, city) VALUES ('PITR-GOOD-MARKER', 'pitr-good-marker@example.com', 'ZZ', 'Good City');
 SELECT now();   -- write this timestamp down
 SELECT pg_switch_wal();
 -- ⚠️ gotcha #2: WAL only archives once a segment is FULL. A quick insert-then-drop stays
 -- in one still-open segment that never reaches the archive - always force a switch after
 -- anything you want recoverable in a quick demo.
 
--- the "bad" change:
+-- the "bad" change: CASCADE also takes v_customer_ltv (it SELECTs from customers) and the
+-- orders -> customers foreign key with it - a bigger blast radius than a toy table, which is
+-- exactly why you want PITR for this kind of mistake.
 DROP TABLE customers CASCADE;
 SELECT pg_switch_wal();
 ```
@@ -438,16 +502,19 @@ docker run --rm --network pglab -v /data/postgres-oss-pitr-basebackup:/backup -e
   --user 999:999 postgres:latest pg_basebackup -h postgres-oss -U appuser -D /backup -P
 ```
 
+Connect with `-d shop` for all three of these (`docker exec postgres-oss psql -U appuser -d shop`):
 ```sql
 -- "good" marker, then force the WAL segment to actually reach the archive:
-INSERT INTO customers (name, city, country) VALUES ('PITR-GOOD-MARKER', 'Good City', 'ZZ');
+INSERT INTO customers (full_name, email, country, city) VALUES ('PITR-GOOD-MARKER', 'pitr-good-marker@example.com', 'ZZ', 'Good City');
 SELECT now();   -- write this timestamp down
 SELECT pg_switch_wal();
 -- ⚠️ gotcha #2: WAL only archives once a segment is FULL. A quick insert-then-drop stays
 -- in one still-open segment that never reaches the archive - always force a switch after
 -- anything you want recoverable in a quick demo.
 
--- the "bad" change:
+-- the "bad" change: CASCADE also takes v_customer_ltv (it SELECTs from customers) and the
+-- orders -> customers foreign key with it - a bigger blast radius than a toy table, which is
+-- exactly why you want PITR for this kind of mistake.
 DROP TABLE customers CASCADE;
 SELECT pg_switch_wal();
 ```
@@ -472,21 +539,29 @@ docker run -d --name postgres-oss-pitr --network pglab \
   postgres:latest
 ```
 
-Verify (either image, swap in the right restore container name):
+Verify (either image, swap in the right restore container name, connect with `-d shop`):
 ```sql
-SELECT * FROM customers;              -- table's back, good marker present, drop never happened
-SELECT pg_is_in_recovery();           -- f - cleanly promoted to a new timeline
+SELECT count(*) FROM customers;                                   -- 2001 - the good marker, drop never happened
+SELECT full_name FROM customers WHERE full_name='PITR-GOOD-MARKER';  -- present
+SELECT * FROM v_customer_ltv LIMIT 1;                              -- the view survived too, restored along with the table
+SELECT pg_is_in_recovery();                                        -- f - cleanly promoted to a new timeline
+```
+
+⚠️ **The `DROP TABLE customers CASCADE;` above ran against the *primary* container, not a copy** — that's deliberate, it's what makes the "bad change" real, but it means the primary's own `shop` database is left with `customers` (and `v_customer_ltv`, and the `orders` FK) genuinely dropped once you're done with this demo. The restore you just verified lives in the separate `-pitr` container, not back on the primary. To put the primary back in a normal state afterward, just re-run Step 0 against it — `01_shop_schema.sql` recreates `customers`/`orders`/both views from scratch, then `02_load_data.sql` reloads the same reproducible 2,000/50,000-row dataset:
+```bash
+docker exec <primary-container> psql -U appuser -d shop -f /tmp/01_shop_schema.sql
+docker exec <primary-container> psql -U appuser -d shop -f /tmp/02_load_data.sql
 ```
 
 ## Cleaning up the labs
 
-Drop the objects this guide created, keeping your base Postgres install intact:
+The `shop` database (`customers`/`orders` and the two views) is meant to stay — it's the persistent dataset the labs are built around, and `02_load_data.sql` is idempotent if you ever want to reset it back to the original 2,000/50,000-row baseline (`TRUNCATE ... RESTART IDENTITY CASCADE` runs automatically at the top of that script). Only drop the scratch objects Steps 3/4/6 created on top of it:
 ```sql
-DROP SCHEMA training CASCADE;
-DROP TABLE demo_orders;
-DROP TABLE IF EXISTS customers CASCADE;
-DROP TABLE IF EXISTS orders;
+DROP SCHEMA IF EXISTS training CASCADE;
+DROP TABLE IF EXISTS demo_orders;
+DROP INDEX IF EXISTS orders_customer_id_idx;   -- only if Step 6's index is still there
 ```
+If you ran Step 5's MVCC demo or Step 9's replication test and didn't already reset them, also run `UPDATE customers SET country='UK' WHERE customer_id=1;` and delete any leftover `ReplicaTest`/`PITR-GOOD-MARKER` rows (`DELETE FROM customers WHERE full_name IN ('ReplicaTest','PITR-GOOD-MARKER');`) so the next person starts from the same baseline.
 
 If you built the replication/PITR containers in Steps 9-10, remove those too:
 
