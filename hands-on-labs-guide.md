@@ -117,6 +117,44 @@ SELECT nextval('training.ticket_no');   -- 1
 
 A "user" is just a role with the `LOGIN` privilege set — same underlying object. `GENERATED ALWAYS AS IDENTITY` (or a standalone sequence like the one above) auto-generates primary keys.
 
+### Sequence vs. auto-increment: when do you need a standalone one?
+
+In Postgres, an "auto-increment" primary key (`GENERATED ALWAYS AS IDENTITY`, or the older `serial`) *is* a sequence — Postgres just creates a private one automatically and binds it to that column. `customers.customer_id` and `orders.order_id` each have their own separate sequence this way, which is why `customer_id=5` and `order_id=5` can both exist at once — that's fine, a primary key only has to be unique within its own table.
+
+A **standalone** sequence earns its keep when you want IDs to be unique *across* tables — point more than one table's column at the *same* sequence:
+
+```sql
+CREATE SEQUENCE training.shared_id_seq;
+
+CREATE TABLE training.widgets (
+    widget_id bigint PRIMARY KEY DEFAULT nextval('training.shared_id_seq'),
+    name text
+);
+CREATE TABLE training.gadgets (
+    gadget_id bigint PRIMARY KEY DEFAULT nextval('training.shared_id_seq'),
+    name text
+);
+
+INSERT INTO training.widgets (name) VALUES ('Widget A') RETURNING widget_id;
+INSERT INTO training.gadgets (name) VALUES ('Gadget A') RETURNING gadget_id;
+INSERT INTO training.widgets (name) VALUES ('Widget B') RETURNING widget_id;
+```
+Real output, tested:
+```
+ widget_id
+-----------
+         1
+ gadget_id
+-----------
+         2
+ widget_id
+-----------
+         3
+```
+`widgets` and `gadgets` never produce the same ID, because both draw from one shared counter instead of each getting its own. Other reasons to reach for a standalone sequence: you need the next value *before* running the `INSERT` (e.g. to embed in a filename or receipt), or you just need a bare counter not attached to any table row — `training.ticket_no` above is exactly that.
+
+⚠️ **Caveat:** sequences aren't gap-free — a rolled-back transaction still burns the value it called `nextval()` on, and nothing reclaims it. Fine for uniqueness; not a fit if someone specifically needs no-gaps sequential numbering (e.g. certain invoice-numbering requirements) — that needs a different, slower, locking-based pattern.
+
 **Compared to Oracle/SQL Server:** Oracle historically ties a "schema" to what most people call a "user" — Postgres's cluster → database → schema → table hierarchy is closer to SQL Server's. Postgres and Oracle both have real standalone sequences; SQL Server didn't get sequences until 2012 (before that, only `IDENTITY` columns), which is why SQL Server users often reach for `IDENTITY` reflexively.
 
 ## Step 4: SQL & data-type essentials
