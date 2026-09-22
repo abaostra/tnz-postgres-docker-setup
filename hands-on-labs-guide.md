@@ -173,6 +173,46 @@ Data types worth knowing:
 
 Constraints — primary key, foreign key, unique, not-null, check — are all enforced at the database level, not just in application code.
 
+### Adding a constraint to a table that already has data
+
+Yes, you can — `ALTER TABLE` validates the new constraint against every existing row, and fails the whole statement if even one row violates it. The catch: a plain `ADD CONSTRAINT` takes an `ACCESS EXCLUSIVE` lock and scans the whole table before it returns — fine on a small table, painful on a large, busy production one. The production-safe pattern splits it into two steps:
+
+```sql
+-- naive way (commented out - this is the thing NOT to do on a large/busy table):
+-- ALTER TABLE orders ADD CONSTRAINT chk_order_amount_cap CHECK (order_amount <= 5000);
+-- ^ ACCESS EXCLUSIVE lock + a full scan of all 50,000 rows before it returns -
+--   blocks reads AND writes on the table for the duration.
+
+-- step 1: add it immediately, don't validate existing rows yet
+ALTER TABLE orders ADD CONSTRAINT chk_order_amount_cap
+    CHECK (order_amount <= 5000) NOT VALID;
+
+SELECT conname, convalidated FROM pg_constraint WHERE conname = 'chk_order_amount_cap';
+
+-- step 2: validate separately - lighter lock, doesn't block concurrent reads/writes
+ALTER TABLE orders VALIDATE CONSTRAINT chk_order_amount_cap;
+
+SELECT conname, convalidated FROM pg_constraint WHERE conname = 'chk_order_amount_cap';
+```
+
+Real output, tested against the live `orders` table (50,000 rows) — every `order_amount` in the seeded data tops out at 4999.95 (see the query above), comfortably under the 5000 cap, so this validates cleanly:
+```
+ALTER TABLE
+       conname        | convalidated
+----------------------+--------------
+ chk_order_amount_cap | f
+(1 row)
+
+ALTER TABLE
+       conname        | convalidated
+----------------------+--------------
+ chk_order_amount_cap | t
+(1 row)
+```
+Step 1's `NOT VALID` constraint takes effect on new `INSERT`/`UPDATE`s immediately (try inserting a row with `order_amount = 6000` right after step 1 and before step 2 — it's already rejected) — it just doesn't retroactively check what's already there until step 2 runs, and step 2 only needs a `SHARE UPDATE EXCLUSIVE` lock rather than `ACCESS EXCLUSIVE`. This is core `ALTER TABLE`/catalog behavior, identical on Tanzu and open-source — not something either image changes.
+
+Drop it afterward so the table's back to baseline: `ALTER TABLE orders DROP CONSTRAINT chk_order_amount_cap;`
+
 **Compared to Oracle/SQL Server:** Postgres treats `text` and `varchar` identically internally (no performance reason to prefer one) — Oracle's `VARCHAR2` has a hard byte limit and treats an empty string as `NULL`, which trips up people moving from Oracle (Postgres, like SQL Server, treats them as distinct). Postgres's `jsonb` predates native JSON support in both Oracle (21c) and SQL Server, and is generally the most mature of the three for indexed JSON queries. Neither Oracle nor SQL Server has a native array column type the way Postgres does.
 
 ## Step 5: Transactions & MVCC
